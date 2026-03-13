@@ -2,6 +2,12 @@
 
 Calculate time-weighted average ERC20 token holdings and distribute rewards proportionally across holders.
 
+**Live app: [maxsam4.github.io/erc20-holdings-reward-calculator](https://maxsam4.github.io/erc20-holdings-reward-calculator/)**
+
+## Privacy
+
+Everything runs entirely in your browser. Your Etherscan API key is used only for direct requests from your browser to the Etherscan API — it never leaves your device or passes through any intermediary server.
+
 ## How It Works
 
 1. **Configure**: Select a chain, enter a token contract address, and provide an Etherscan API key
