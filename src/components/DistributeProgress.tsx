@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import { erc20Abi, formatUnits } from "viem";
-import type { Address } from "viem";
+import type { Address, PublicClient } from "viem";
 import {
   DISPERSE_ADDRESS,
   estimateDisperseGas,
@@ -54,6 +54,7 @@ export default function DistributeProgress({
   const [leftover, setLeftover] = useState<bigint>(0n);
 
   const batchesRef = useRef<ParsedRecipient[][]>([]);
+  const hashesRef = useRef<Array<`0x${string}` | undefined>>([]);
   const cursorRef = useRef(0);
   const startAccountRef = useRef<Address | null>(null);
   const startChainRef = useRef<number | null>(null);
@@ -65,12 +66,20 @@ export default function DistributeProgress({
   const grandTotal = sumAmounts(recipients.map((r) => r.amount));
   const fmt = (v: bigint) => formatUnits(v, decimals);
 
-  function contextChanged(): boolean {
-    const w = walletRef.current;
-    return (
-      w.account !== startAccountRef.current ||
-      w.chainId !== startChainRef.current
-    );
+  // Assert (via a live eth_chainId round-trip, not just the async-updated
+  // chainChanged state) that we are still on the same account+chain captured at
+  // the start of the run. Throws to halt before any approval/send if the wallet
+  // switched away and back during an awaited step.
+  async function ensureContext(client: PublicClient): Promise<void> {
+    const live = await client.getChainId();
+    if (
+      live !== startChainRef.current ||
+      walletRef.current.account !== startAccountRef.current
+    ) {
+      throw new Error(
+        "Wallet network or account changed — halted to avoid sending on the wrong chain.",
+      );
+    }
   }
 
   function setBatch(index: number, patch: Partial<Step>) {
@@ -91,30 +100,45 @@ export default function DistributeProgress({
     setPhase("running");
     for (let i = from; i < batchesRef.current.length; i++) {
       cursorRef.current = i;
-      if (contextChanged()) {
-        setFatal("Wallet account or network changed — sending was halted.");
-        setPhase("error");
-        return;
-      }
       const batch = batchesRef.current[i];
-      setBatch(i, { status: "signing", error: undefined });
       try {
-        const hash = await sendDisperse(
-          walletClient,
-          account,
-          chain,
-          asset,
-          batch.map((r) => r.address),
-          batch.map((r) => r.amount),
-        );
-        setBatch(i, { status: "mining", hash });
+        await ensureContext(publicClient);
+        // If this batch was already broadcast (hash recorded), resolve that tx
+        // instead of sending again — prevents a double-send when a previous
+        // attempt failed *after* broadcast (e.g. receipt polling glitch).
+        let hash = hashesRef.current[i];
+        if (!hash) {
+          setBatch(i, { status: "signing", error: undefined });
+          hash = await sendDisperse(
+            walletClient,
+            account,
+            chain,
+            asset,
+            batch.map((r) => r.address),
+            batch.map((r) => r.amount),
+          );
+          hashesRef.current[i] = hash;
+        }
+        setBatch(i, { status: "mining", hash, error: undefined });
         const receipt = await publicClient.waitForTransactionReceipt({ hash });
-        if (receipt.status !== "success") throw new Error("Transaction reverted");
-        setBatch(i, { status: "done" });
+        if (receipt.status !== "success") {
+          // Reverted: no funds moved, so it is safe to resend on retry.
+          hashesRef.current[i] = undefined;
+          setBatch(i, {
+            status: "failed",
+            hash: undefined,
+            error: "Transaction reverted",
+          });
+          setPhase("error");
+          return;
+        }
+        setBatch(i, { status: "done", hash });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
-        const hint =
-          asset.kind === "native"
+        const broadcast = !!hashesRef.current[i];
+        const hint = broadcast
+          ? " — already broadcast; Retry will check its status rather than resend."
+          : asset.kind === "native"
             ? " A recipient contract may have rejected the transfer; remove it and retry."
             : "";
         setBatch(i, { status: "failed", error: msg + hint });
@@ -156,6 +180,7 @@ export default function DistributeProgress({
     setPhase("running");
 
     try {
+      await ensureContext(publicClient);
       // 1. Verify the Disperse contract bytecode on this chain.
       if (!(await verifyDisperse(publicClient))) {
         setFatal(
@@ -199,18 +224,35 @@ export default function DistributeProgress({
         );
         if (allowance < grandTotal) {
           if (allowance > 0n) {
-            setApproveStep({ label: "Reset existing allowance to 0", status: "signing" });
+            // USDT-style tokens reject a non-zero→non-zero allowance change.
+            await ensureContext(publicClient);
+            const resetLabel = "Reset existing allowance to 0";
+            setApproveStep({ label: resetLabel, status: "signing" });
             const h0 = await approve(walletClient, account, chain, asset.token, DISPERSE_ADDRESS, 0n);
-            setApproveStep({ label: "Reset existing allowance to 0", status: "mining", hash: h0 });
-            await publicClient.waitForTransactionReceipt({ hash: h0 });
+            setApproveStep({ label: resetLabel, status: "mining", hash: h0 });
+            const r0 = await publicClient.waitForTransactionReceipt({ hash: h0 });
+            if (r0.status !== "success") {
+              setApproveStep({ label: resetLabel, status: "failed", hash: h0, error: "Reset reverted" });
+              setFatal("Allowance reset transaction reverted.");
+              setPhase("error");
+              return;
+            }
           }
-          setApproveStep({ label: `Approve ${fmt(grandTotal)} ${symbol}`, status: "signing" });
+          await ensureContext(publicClient);
+          const approveLabel = `Approve ${fmt(grandTotal)} ${symbol}`;
+          setApproveStep({ label: approveLabel, status: "signing" });
           const h = await approve(walletClient, account, chain, asset.token, DISPERSE_ADDRESS, grandTotal);
-          setApproveStep({ label: `Approve ${fmt(grandTotal)} ${symbol}`, status: "mining", hash: h });
-          await publicClient.waitForTransactionReceipt({ hash: h });
+          setApproveStep({ label: approveLabel, status: "mining", hash: h });
+          const r = await publicClient.waitForTransactionReceipt({ hash: h });
+          if (r.status !== "success") {
+            setApproveStep({ label: approveLabel, status: "failed", hash: h, error: "Approve reverted" });
+            setFatal("Approval transaction reverted.");
+            setPhase("error");
+            return;
+          }
           allowance = await readAllowance(publicClient, asset.token, account, DISPERSE_ADDRESS);
           if (allowance < grandTotal) {
-            setApproveStep({ label: "Approve", status: "failed", error: "Allowance still insufficient." });
+            setApproveStep({ label: approveLabel, status: "failed", hash: h, error: "Allowance still insufficient." });
             setFatal("Approval did not grant enough allowance.");
             setPhase("error");
             return;
@@ -236,6 +278,7 @@ export default function DistributeProgress({
         batchSize,
       );
       batchesRef.current = batches;
+      hashesRef.current = batches.map(() => undefined);
       setBatchSteps(
         batches.map((b, i) => ({
           label: `Batch ${i + 1} · ${b.length} recipients · ${fmt(sumAmounts(b.map((r) => r.amount)))} ${symbol}`,
@@ -347,14 +390,31 @@ export default function DistributeProgress({
       )}
 
       {phase === "error" && (
-        <div className="flex gap-2">
-          <button
-            onClick={() => processBatches(cursorRef.current)}
-            disabled={batchesRef.current.length === 0}
-            className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
-          >
-            Retry from failed batch
-          </button>
+        <div className="flex flex-wrap gap-2">
+          {batchesRef.current.length > 0 ? (
+            <button
+              onClick={() => processBatches(cursorRef.current)}
+              className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+            >
+              Retry from failed batch
+            </button>
+          ) : (
+            <button
+              onClick={start}
+              className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+            >
+              Try again
+            </button>
+          )}
+          {asset.kind === "token" && (
+            <button
+              onClick={revoke}
+              className="rounded-md border border-amber-300 bg-white px-4 py-2 text-sm font-medium text-amber-800 hover:bg-amber-50"
+              title="Set the Disperse allowance back to 0"
+            >
+              Revoke approval
+            </button>
+          )}
           <button
             onClick={onClose}
             className="rounded-md border border-gray-300 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50"

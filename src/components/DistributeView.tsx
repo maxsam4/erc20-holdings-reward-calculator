@@ -78,6 +78,7 @@ export default function DistributeView({
     let cancelled = false;
     async function load() {
       setMetaError(null);
+      setMetaLoading(false);
       if (!connected || !wallet.publicClient || !wallet.account) {
         setMeta(null);
         return;

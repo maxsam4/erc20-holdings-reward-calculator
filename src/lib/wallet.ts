@@ -56,25 +56,31 @@ function useDiscoveredProviders(): EIP6963ProviderDetail[] {
     window.addEventListener("eip6963:announceProvider", onAnnounce as EventListener);
     window.dispatchEvent(new Event("eip6963:requestProvider"));
 
-    // Legacy fallback: surface window.ethereum if nothing announced.
-    const injected = (window as unknown as { ethereum?: EIP1193Provider & Record<string, unknown> }).ethereum;
-    if (injected) {
+    // Legacy fallback: only surface window.ethereum if no EIP-6963 wallet has
+    // announced itself shortly after the request, so a 6963-capable wallet
+    // (MetaMask/Rabby) is not also listed a second time as "injected".
+    const fallbackTimer = window.setTimeout(() => {
+      if (byUuid.size > 0) return;
+      const injected = (
+        window as unknown as { ethereum?: EIP1193Provider & Record<string, unknown> }
+      ).ethereum;
+      if (!injected) return;
       const name = injected.isRabby
         ? "Rabby"
         : injected.isMetaMask
           ? "MetaMask"
           : "Browser Wallet";
-      if (![...byUuid.values()].some((p) => p.provider === injected)) {
-        byUuid.set("injected", {
-          info: { uuid: "injected", name, icon: "", rdns: "injected" },
-          provider: injected,
-        });
-        setProviders(Array.from(byUuid.values()));
-      }
-    }
+      byUuid.set("injected", {
+        info: { uuid: "injected", name, icon: "", rdns: "injected" },
+        provider: injected,
+      });
+      setProviders(Array.from(byUuid.values()));
+    }, 400);
 
-    return () =>
+    return () => {
+      window.clearTimeout(fallbackTimer);
       window.removeEventListener("eip6963:announceProvider", onAnnounce as EventListener);
+    };
   }, []);
 
   return providers;
@@ -155,12 +161,18 @@ export function useWallet(): WalletState {
         });
       } catch (e) {
         const code = (e as { code?: number })?.code;
-        if (code === 4902) {
-          const vc = getViemChain(target);
-          if (!vc) {
-            setError("Unsupported chain");
-            return;
-          }
+        if (code === 4001) return; // user rejected
+        if (code !== 4902) {
+          setError(e instanceof Error ? e.message : "Failed to switch chain");
+          return;
+        }
+        // 4902: chain unknown to the wallet — add it, then switch to it.
+        const vc = getViemChain(target);
+        if (!vc) {
+          setError("Unsupported chain");
+          return;
+        }
+        try {
           await provider.request({
             method: "wallet_addEthereumChain",
             params: [
@@ -175,8 +187,15 @@ export function useWallet(): WalletState {
               },
             ],
           });
-        } else if (code !== 4001) {
-          setError(e instanceof Error ? e.message : "Failed to switch chain");
+          await provider.request({
+            method: "wallet_switchEthereumChain",
+            params: [{ chainId: hexId }],
+          });
+        } catch (addErr) {
+          const addCode = (addErr as { code?: number })?.code;
+          if (addCode !== 4001) {
+            setError(addErr instanceof Error ? addErr.message : "Failed to add network");
+          }
         }
       }
       // chainChanged fires on success and updates chainId.
