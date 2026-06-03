@@ -52,6 +52,7 @@ export default function DistributeProgress({
   const [batchSteps, setBatchSteps] = useState<Step[]>([]);
   const [fatal, setFatal] = useState<string | null>(null);
   const [leftover, setLeftover] = useState<bigint>(0n);
+  const [revoked, setRevoked] = useState(false);
 
   const batchesRef = useRef<ParsedRecipient[][]>([]);
   const hashesRef = useRef<Array<`0x${string}` | undefined>>([]);
@@ -262,6 +263,7 @@ export default function DistributeProgress({
       }
 
       // 4. Gas-aware batching.
+      await ensureContext(publicClient);
       const block = await publicClient.getBlock();
       const gasCap = (block.gasLimit * 90n) / 100n;
       const batches = await splitToFittingBatches(
@@ -299,6 +301,9 @@ export default function DistributeProgress({
     const chain = getViemChain(chainId);
     if (asset.kind !== "token" || !walletClient || !publicClient || !account || !chain)
       return;
+    // Revoking is terminal: it drops the allowance the remaining batches would
+    // need, so retry is disabled afterwards (reopen to start a fresh run).
+    setRevoked(true);
     try {
       const h = await approve(walletClient, account, chain, asset.token, DISPERSE_ADDRESS, 0n);
       await publicClient.waitForTransactionReceipt({ hash: h });
@@ -390,37 +395,45 @@ export default function DistributeProgress({
       )}
 
       {phase === "error" && (
-        <div className="flex flex-wrap gap-2">
-          {batchesRef.current.length > 0 ? (
-            <button
-              onClick={() => processBatches(cursorRef.current)}
-              className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
-            >
-              Retry from failed batch
-            </button>
-          ) : (
-            <button
-              onClick={start}
-              className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
-            >
-              Try again
-            </button>
+        <div className="space-y-2">
+          {revoked && (
+            <p className="text-xs text-amber-700">
+              Approval revoked — reopen this dialog to start a new distribution.
+            </p>
           )}
-          {asset.kind === "token" && (
+          <div className="flex flex-wrap gap-2">
+            {!revoked &&
+              (batchesRef.current.length > 0 ? (
+                <button
+                  onClick={() => processBatches(cursorRef.current)}
+                  className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+                >
+                  Retry from failed batch
+                </button>
+              ) : (
+                <button
+                  onClick={start}
+                  className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+                >
+                  Try again
+                </button>
+              ))}
+            {asset.kind === "token" && !revoked && (
+              <button
+                onClick={revoke}
+                className="rounded-md border border-amber-300 bg-white px-4 py-2 text-sm font-medium text-amber-800 hover:bg-amber-50"
+                title="Set the Disperse allowance back to 0 (stops this run)"
+              >
+                Revoke approval
+              </button>
+            )}
             <button
-              onClick={revoke}
-              className="rounded-md border border-amber-300 bg-white px-4 py-2 text-sm font-medium text-amber-800 hover:bg-amber-50"
-              title="Set the Disperse allowance back to 0"
+              onClick={onClose}
+              className="rounded-md border border-gray-300 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50"
             >
-              Revoke approval
+              Close
             </button>
-          )}
-          <button
-            onClick={onClose}
-            className="rounded-md border border-gray-300 px-4 py-2 text-sm text-gray-600 hover:bg-gray-50"
-          >
-            Close
-          </button>
+          </div>
         </div>
       )}
 
