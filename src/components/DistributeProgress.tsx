@@ -15,7 +15,37 @@ import { getViemChain } from "../lib/viemChains";
 import type { WalletState } from "../lib/wallet";
 import type { ParsedRecipient } from "./RecipientEditor";
 
-type StepStatus = "pending" | "signing" | "mining" | "done" | "failed";
+type StepStatus = "pending" | "signing" | "mining" | "unknown" | "done" | "failed";
+
+type Outcome = "success" | "reverted" | "pending";
+
+// Resolve a broadcast tx's outcome robustly. A plain waitForTransactionReceipt
+// over a wallet/L2 RPC can time out even though the tx was mined (Polygon RPC
+// lag, flaky block-watching over injected transports). So: try a direct
+// one-shot receipt read first, then wait with a generous timeout, and only
+// report "pending" (NOT failed) if it still can't be confirmed — the tx may
+// well succeed, and the caller keeps the hash so it can be re-checked.
+async function resolveReceipt(
+  client: PublicClient,
+  hash: `0x${string}`,
+): Promise<Outcome> {
+  try {
+    const r = await client.getTransactionReceipt({ hash });
+    return r.status === "success" ? "success" : "reverted";
+  } catch {
+    // Not indexed yet — fall through to a watched wait.
+  }
+  try {
+    const r = await client.waitForTransactionReceipt({
+      hash,
+      timeout: 180_000,
+      pollingInterval: 4_000,
+    });
+    return r.status === "success" ? "success" : "reverted";
+  } catch {
+    return "pending";
+  }
+}
 
 interface Step {
   label: string;
@@ -121,8 +151,8 @@ export default function DistributeProgress({
           hashesRef.current[i] = hash;
         }
         setBatch(i, { status: "mining", hash, error: undefined });
-        const receipt = await publicClient.waitForTransactionReceipt({ hash });
-        if (receipt.status !== "success") {
+        const outcome = await resolveReceipt(publicClient, hash);
+        if (outcome === "reverted") {
           // Reverted: no funds moved, so it is safe to resend on retry.
           hashesRef.current[i] = undefined;
           setBatch(i, {
@@ -133,16 +163,39 @@ export default function DistributeProgress({
           setPhase("error");
           return;
         }
+        if (outcome === "pending") {
+          // Broadcast but the RPC couldn't confirm it in time. Keep the hash so
+          // "Check status" re-resolves it instead of resending. Do NOT mark
+          // failed — it has very likely succeeded.
+          setBatch(i, {
+            status: "unknown",
+            hash,
+            error: "Broadcast — awaiting confirmation. Use “Check status” to resume.",
+          });
+          setFatal(
+            "A transaction was broadcast but the RPC hasn't confirmed it yet. It may already have succeeded — open it in the explorer, then use “Check status & continue”. It will not be resent.",
+          );
+          setPhase("error");
+          return;
+        }
         setBatch(i, { status: "done", hash });
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         const broadcast = !!hashesRef.current[i];
-        const hint = broadcast
-          ? " — already broadcast; Retry will check its status rather than resend."
-          : asset.kind === "native"
-            ? " A recipient contract may have rejected the transfer; remove it and retry."
-            : "";
-        setBatch(i, { status: "failed", error: msg + hint });
+        if (broadcast) {
+          // Send succeeded but a later step threw — never resend; re-check.
+          setBatch(i, {
+            status: "unknown",
+            hash: hashesRef.current[i],
+            error: msg + " — already broadcast; “Check status” will re-check, not resend.",
+          });
+        } else {
+          const hint =
+            asset.kind === "native"
+              ? " A recipient contract may have rejected the transfer; remove it and retry."
+              : "";
+          setBatch(i, { status: "failed", error: msg + hint });
+        }
         setPhase("error");
         return;
       }
@@ -231,8 +284,7 @@ export default function DistributeProgress({
             setApproveStep({ label: resetLabel, status: "signing" });
             const h0 = await approve(walletClient, account, chain, asset.token, DISPERSE_ADDRESS, 0n);
             setApproveStep({ label: resetLabel, status: "mining", hash: h0 });
-            const r0 = await publicClient.waitForTransactionReceipt({ hash: h0 });
-            if (r0.status !== "success") {
+            if ((await resolveReceipt(publicClient, h0)) === "reverted") {
               setApproveStep({ label: resetLabel, status: "failed", hash: h0, error: "Reset reverted" });
               setFatal("Allowance reset transaction reverted.");
               setPhase("error");
@@ -244,17 +296,18 @@ export default function DistributeProgress({
           setApproveStep({ label: approveLabel, status: "signing" });
           const h = await approve(walletClient, account, chain, asset.token, DISPERSE_ADDRESS, grandTotal);
           setApproveStep({ label: approveLabel, status: "mining", hash: h });
-          const r = await publicClient.waitForTransactionReceipt({ hash: h });
-          if (r.status !== "success") {
+          if ((await resolveReceipt(publicClient, h)) === "reverted") {
             setApproveStep({ label: approveLabel, status: "failed", hash: h, error: "Approve reverted" });
             setFatal("Approval transaction reverted.");
             setPhase("error");
             return;
           }
+          // The on-chain allowance is the source of truth even if the receipt
+          // couldn't be confirmed in time.
           allowance = await readAllowance(publicClient, asset.token, account, DISPERSE_ADDRESS);
           if (allowance < grandTotal) {
-            setApproveStep({ label: approveLabel, status: "failed", hash: h, error: "Allowance still insufficient." });
-            setFatal("Approval did not grant enough allowance.");
+            setApproveStep({ label: approveLabel, status: "failed", hash: h, error: "Allowance not yet sufficient — retry." });
+            setFatal("Approval isn't confirmed yet (allowance still below the total). Retry to re-check.");
             setPhase("error");
             return;
           }
@@ -318,6 +371,7 @@ export default function DistributeProgress({
       pending: "text-gray-300",
       signing: "text-blue-500 animate-pulse",
       mining: "text-blue-500 animate-pulse",
+      unknown: "text-amber-500",
       done: "text-green-600",
       failed: "text-red-600",
     };
@@ -325,6 +379,7 @@ export default function DistributeProgress({
       pending: "○",
       signing: "◔",
       mining: "◑",
+      unknown: "◷",
       done: "●",
       failed: "✕",
     };
@@ -408,7 +463,9 @@ export default function DistributeProgress({
                   onClick={() => processBatches(cursorRef.current)}
                   className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
                 >
-                  Retry from failed batch
+                  {hashesRef.current[cursorRef.current]
+                    ? "Check status & continue"
+                    : "Retry from failed batch"}
                 </button>
               ) : (
                 <button
