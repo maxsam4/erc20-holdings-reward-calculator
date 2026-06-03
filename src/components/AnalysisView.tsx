@@ -2,14 +2,17 @@ import { useState, useMemo, useCallback } from "react";
 import type { BalanceTimelines } from "../lib/balance";
 import { computeTimeWeightedAverages } from "../lib/balance";
 import type { TokenInfo } from "../lib/etherscan";
+import type { Chain } from "../lib/chains";
 import { exportCSV, downloadCSV } from "../lib/csv";
 import ResultsTable from "./ResultsTable";
 import ExcludeAddresses from "./ExcludeAddresses";
+import DistributeView from "./DistributeView";
 
 interface AnalysisViewProps {
   timelines: BalanceTimelines;
   tokenInfo: TokenInfo;
-  explorerUrl: string;
+  tokenAddress: string;
+  chain: Chain;
 }
 
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
@@ -46,8 +49,11 @@ function getPresetDates(preset: string): [string, string] {
 export default function AnalysisView({
   timelines,
   tokenInfo,
-  explorerUrl,
+  tokenAddress,
+  chain,
 }: AnalysisViewProps) {
+  const explorerUrl = chain.blockExplorerUrl;
+  const [distributing, setDistributing] = useState(false);
   const [preset, setPreset] = useState("last30");
   const defaultDates = getPresetDates("last30");
   const [startDate, setStartDate] = useState(defaultDates[0]);
@@ -242,13 +248,22 @@ export default function AnalysisView({
             </>
           )}
         </div>
-        <button
-          onClick={handleExport}
-          disabled={results.length === 0}
-          className="rounded-md bg-green-600 px-4 py-2 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-50"
-        >
-          Export CSV
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={handleExport}
+            disabled={results.length === 0}
+            className="rounded-md bg-green-600 px-4 py-2 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-50"
+          >
+            Export CSV
+          </button>
+          <button
+            onClick={() => setDistributing(true)}
+            disabled={results.length === 0}
+            className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+          >
+            Distribute rewards
+          </button>
+        </div>
       </div>
 
       <ResultsTable
@@ -258,6 +273,20 @@ export default function AnalysisView({
         hasReward={hasReward}
         explorerUrl={explorerUrl}
       />
+
+      {distributing && (
+        <DistributeView
+          results={results}
+          analyzedToken={{
+            address: tokenAddress,
+            symbol: tokenInfo.symbol,
+            decimals: tokenInfo.decimals,
+          }}
+          analysisChain={chain}
+          defaultTotal={totalReward}
+          onClose={() => setDistributing(false)}
+        />
+      )}
     </div>
   );
 }

@@ -23,6 +23,7 @@ type AppState =
       step: "analysis";
       timelines: BalanceTimelines;
       tokenInfo: TokenInfo;
+      tokenAddress: string;
       chain: Chain;
     }
   | { step: "error"; message: string };
@@ -103,7 +104,7 @@ export default function App() {
 
         const timelines = buildBalanceTimelines(allEvents);
 
-        setState({ step: "analysis", timelines, tokenInfo, chain });
+        setState({ step: "analysis", timelines, tokenInfo, tokenAddress, chain });
       } catch (err) {
         if (err instanceof DOMException && err.name === "AbortError") return;
         setState({
@@ -173,7 +174,8 @@ export default function App() {
           <AnalysisView
             timelines={state.timelines}
             tokenInfo={state.tokenInfo}
-            explorerUrl={state.chain.blockExplorerUrl}
+            tokenAddress={state.tokenAddress}
+            chain={state.chain}
           />
         </div>
       )}
